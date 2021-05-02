@@ -17,9 +17,9 @@ from evaluation import AverageMeter, LogCollector
 def main():
     # Hyper Parameters
     parser = argparse.ArgumentParser()
-    parser.add_argument('--data_path', default='../VideoMomentRetrieval/data/',
+    parser.add_argument('--data_path', default='data/',
                         help='path to datasets')
-    parser.add_argument('--pretrained_path', default='../VideoMomentRetrieval/rgb_vgg_fc7_features/',
+    parser.add_argument('--pretrained_path', default='rgb_vgg_fc7_features/',
                         help='path to extracted features')
     parser.add_argument('--vocab_path', default='./vocab/',
                         help='Path to saved vocabulary json files.')
@@ -79,7 +79,6 @@ def main():
 
     opt.bi_gru = True
     opt.max_violation = True
-    opt.agg_func = "Mean"
     print(opt)
 
     logging.basicConfig(format='%(asctime)s %(message)s', level=logging.INFO)
@@ -94,6 +93,8 @@ def main():
 
     # Construct the model
     model = SCAN(opt, vocab)
+    # model = torch.nn.DataParallel(model)
+    # model.cuda()
 
     # Train the Model
     for epoch in range(opt.num_epochs):
@@ -230,6 +231,11 @@ def validate(opt, val_loader, model):
     print("Average rank@5: %f" % rank5)
     print("Average iou: %f" % miou)
     return rank1, rank5, miou
+
+# Average rank@1: 0.144498
+# Average rank@3: 0.323206
+# Average rank@5: 0.421053
+# Average iou: 0.256846
 
 
 if __name__ == '__main__':
