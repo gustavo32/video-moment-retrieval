@@ -8,11 +8,11 @@ import tensorboard_logger as tb_logger
 
 import torch
 from torchtext.vocab import GloVe
+import torch.backends.cudnn as cudnn
 
 import data
-from model import SCAN, func_attention, cosine_similarity
+from model import SCAN
 from evaluation import AverageMeter, LogCollector
-
 
 def main():
     # Hyper Parameters
@@ -27,7 +27,7 @@ def main():
                         help='Rank loss margin.')
     parser.add_argument('--num_epochs', default=10, type=int,
                         help='Number of training epochs.')
-    parser.add_argument('--batch_size', default=16, type=int,
+    parser.add_argument('--batch_size', default=32, type=int,
                         help='Size of a training mini-batch.')
     parser.add_argument('--word_dim', default=50, type=int,
                         help='Dimensionality of the word embedding.')
@@ -41,7 +41,7 @@ def main():
                         help='Initial learning rate.')
     parser.add_argument('--lr_update', default=15, type=int,
                         help='Number of epochs to update the learning rate.')
-    parser.add_argument('--workers', default=10, type=int,
+    parser.add_argument('--workers', default=16, type=int,
                         help='Number of data loader workers.')
     parser.add_argument('--log_step', default=10, type=int,
                         help='Number of steps to print and record the log.')
@@ -79,8 +79,11 @@ def main():
 
     opt.bi_gru = True
     opt.max_violation = True
-    opt.agg_func = "Mean"
     print(opt)
+
+    opt.cuda = torch.cuda.is_available()
+    torch.manual_seed(42)
+    cudnn.benchmark = True
 
     logging.basicConfig(format='%(asctime)s %(message)s', level=logging.INFO)
     tb_logger.configure(opt.logger_name, flush_secs=5)
@@ -94,63 +97,77 @@ def main():
 
     # Construct the model
     model = SCAN(opt, vocab)
+    model = torch.nn.DataParallel(model)
+    model.cuda()
+
+    parameters = filter(lambda p: p.requires_grad, model.parameters())
+    optimizer = torch.optim.Adam(parameters, lr=opt.learning_rate)
+    num_parameters = sum([p.data.nelement() for p in model.parameters() if p.requires_grad])
+    print('  + Number of params: {}'.format(num_parameters))
 
     # Train the Model
     for epoch in range(opt.num_epochs):
         print(opt.logger_name)
         print(opt.model_name)
         # train for one epoch
-        train(opt, train_loader, model, epoch, val_loader)
+        # test(opt, val_loader, model)
+        train(opt, train_loader, model, epoch, optimizer)
+        test(opt, val_loader, model)
 
     # evaluate on validation set
-    miou = validate(opt, val_loader, model)
+    test(opt, val_loader, model)
 
 
-def train(opt, train_loader, model, epoch, val_loader):
+def train(opt, train_loader, model, epoch, optimizer):
     # average meters to record the training statistics
-    batch_time = AverageMeter()
-    data_time = AverageMeter()
-    train_logger = LogCollector()
+    model.train()
+    losses = AverageMeter()
 
-    end = time.time()
     for i, train_data in enumerate(train_loader):
-        # switch to train mode
-        model.train_start()
-
-        # measure data loading time
-        data_time.update(time.time() - end)
-
-        # make sure train logger is used
-        model.logger = train_logger
 
         # Update the model
-        model.train_emb(*train_data)
+        loss = model(*train_data)
+        loss = torch.mean(loss)
+
+        num_items = len(train_data[0])
+        losses.update(loss.data, num_items)
 
         # measure elapsed time
-        batch_time.update(time.time() - end)
-        end = time.time()
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
 
-        # Print log info
-        if model.Eiters % opt.log_step == 0:
-            logging.info(
-                'Epoch: [{0}][{1}/{2}]\t'
-                '{e_log}\t'
-                'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
-                'Data {data_time.val:.3f} ({data_time.avg:.3f})\t'
-                .format(
-                    epoch, i, len(train_loader), batch_time=batch_time,
-                    data_time=data_time, e_log=str(model.logger)))
+        if i % opt.log_step == 0:
+            print('Train Epoch: {} [{}/{}]\t'
+                  'Loss: {:.4f} ({:.4f})'.format(
+                    epoch, i * num_items, len(train_loader.dataset),
+                    losses.val, losses.avg))
 
-        # Record logs in tensorboard
-        tb_logger.log_value('epoch', epoch, step=model.Eiters)
-        tb_logger.log_value('step', i, step=model.Eiters)
-        tb_logger.log_value('batch_time', batch_time.val, step=model.Eiters)
-        tb_logger.log_value('data_time', data_time.val, step=model.Eiters)
-        model.logger.tb_log(tb_logger, step=model.Eiters)
 
-        # validate at every val_step
-        if model.Eiters % opt.val_step == 0:
-            validate(opt, val_loader, model)
+def actual_iou(top_five_indices, gt_times, segments):
+    combined_ious = []
+    for i in range(5):
+        seg_idx = top_five_indices[:, i]
+        tmp_segs = torch.index_select(segments, 1, seg_idx)
+        tmp_segs = tmp_segs[:, 0, :] # torch.Size([64, 2])
+        ious = []
+        for j in range(4):
+            curr_gt = gt_times[:, j, :]
+            gt_start = curr_gt[:, 0]
+            gt_end = curr_gt[:, 1] + 1
+            pred_start = tmp_segs[:, 0]
+            pred_end = tmp_segs[:, 1] + 1
+            intersection = np.minimum(gt_end.cpu().numpy(), pred_end.cpu().numpy()) + 1 - np.maximum(gt_start.cpu().numpy(), pred_start.cpu().numpy())
+            intersection = np.maximum(0., intersection)
+            union = np.maximum(gt_end.cpu().numpy(), pred_end.cpu().numpy()) + 1 - np.minimum(pred_start.cpu().numpy(), gt_start.cpu().numpy())
+            iou_val = np.divide(intersection, union)
+            iou_val = torch.from_numpy(iou_val)
+            ious.append(iou_val.unsqueeze(-1))
+        ious = torch.cat(ious, dim=1)
+        combined_ious.append(ious.unsqueeze(1))
+    combined_ious = torch.cat(combined_ious, dim=1)
+    return combined_ious
+
 
 
 def iou(pred, gt):
@@ -163,62 +180,74 @@ def rank(preds, gt):
     return preds.index(list(gt)) + 1
 
 
-def validate(opt, val_loader, model):
-    batch_time = AverageMeter()
-    val_logger = LogCollector()
+def test(opt, test_loader, model):
+    model.eval()
 
-    # switch to evaluate mode
-    model.val_start()
+    segments = []
+    for i in range(6):
+        for j in range(i, 6):
+            segments.append([i, j])
+    segments = np.array(segments)
+    segments = torch.from_numpy(segments).cuda()
 
-    end = time.time()
+    miou = 0.
+    total_iou = 0.
+    num_correct = 0.
+    acc_5 = 0.
+    num_samples = 0.
+    total_miou = []
 
-    proposals = np.asarray(list(product(range(6), range(6))))
-    proposals = proposals[proposals[:, 1] >= proposals[:, 0]]
-
-    all_proposals = []
     all_y_true = []
-    for i, val_data in enumerate(val_loader):
-        # make sure val logger is used
-        model.logger = val_logger
+    all_proposals = []
+    for i, val_data in enumerate(test_loader):
+        num_samples += len(val_data[0])
 
-        # compute the embeddings
-        img_emb, cap_emb = model.forward_emb(*val_data)
+        confidence_scores, gt_flipped = model(*val_data)  # torch.Size([64, 21])
 
-        batch_proposals = []
-        for j in range(len(img_emb)):
-            row_sim = []
-            for p in proposals:
-                if p[1] <= (val_data[2][j] - 1) // 25:
-                    proposal_img_emb = img_emb[j, p[0]*25:min((p[1]+1)*25, val_data[2][j])].unsqueeze(0).contiguous()
-                    cap_i = cap_emb[j, :val_data[3][j], :].unsqueeze(0).contiguous()
-                    weiContext, attn = func_attention(cap_i, proposal_img_emb, opt, smooth=opt.lambda_softmax)
-                    row_sim.append(cosine_similarity(cap_i, weiContext, dim=2))
-                else:
-                    row_sim.append(torch.ones([val_data[3][j]])*-1.)
-            row_sim = torch.stack(row_sim, 0)
-            if opt.agg_func == 'LogSumExp':
-                row_sim.mul_(opt.lambda_lse).exp_()
-                row_sim = row_sim.sum(dim=1, keepdim=True)
-                row_sim = torch.log(row_sim) / opt.lambda_lse
-            elif opt.agg_func == 'Mean':
-                row_sim = row_sim.mean(dim=1, keepdim=True)
-            ind = torch.argsort(row_sim.view(-1), descending=True)
-            batch_proposals.append(torch.Tensor(proposals[ind]).int())
+        tmp_segs = segments.clone().unsqueeze(0)
+        tmp_segs = tmp_segs.repeat(len(val_data[0]), 1, 1)
 
-        all_proposals.append(torch.cat(batch_proposals))
-        all_y_true.append(val_data[-1])
+        top_five, ind_five = torch.topk(confidence_scores, 5, dim=1, largest=True)
+        ious = actual_iou(ind_five, gt_flipped, tmp_segs)
 
-    all_proposals = torch.cat(all_proposals).view(-1, 21, 2)
-    all_y_true = torch.cat(all_y_true)
+        top_one_ious = ious[:, 0, :]
+        mean_top_one, mean_ind_one = torch.topk(top_one_ious, 3, dim=1)  # torch.Size([64, 3])
+        mean_top_one = torch.mean(mean_top_one, dim=1)
+        miou += torch.sum(mean_top_one)
+        sat = mean_top_one >= 0.5
+        num_correct += torch.sum(sat)
+
+        mean_top_five, mean_ind_five = torch.topk(ious, 3, dim=2)
+        mean_top_five = torch.mean(mean_top_five, dim=2)
+        sat_five = mean_top_five >= 0.5
+        sat_five = torch.sum(sat_five, dim=1)
+        sat_five = sat_five >= 1
+        acc_5 += torch.sum(sat_five)
+
+        indices = torch.argsort(confidence_scores, dim=1)
+
+        all_y_true.append(gt_flipped)
+        all_proposals.append(segments[indices])
+
+    all_y_true = torch.vstack(all_y_true)
+    all_proposals = torch.vstack(all_proposals)
+
+    acc = (float(num_correct) / num_samples) * 100
+    acc_5 = (float(acc_5) / num_samples) * 100
+    miou = (float(miou) / num_samples) * 100
+    # final_miou = np.mean(total_miou) * 100
+    print("")
+    print('R@1 accuracy: ' + str(acc) + '\n' + 'R@5 accuracy: ' + str(acc_5) + '\n' + 'miou: ' + str(miou))
+    print("")
 
     average_iou = []
     average_ranks = []
-    for gts, preds in zip(all_y_true, all_proposals):
+    for gts, preds in zip(all_y_true.cpu().numpy(), all_proposals.cpu().numpy()):
         pred = preds[0]
         ious = [iou(pred, gt) for gt in gts]
         average_iou.append(np.mean(np.sort(ious)[-3:]))
-        list_preds = preds.numpy().tolist()
-        ranks = [rank(list_preds, gt) for gt in gts.numpy()]
+        list_preds = preds.tolist()
+        ranks = [rank(list_preds, gt) for gt in gts]
         average_ranks.append(np.mean(np.sort(ranks)[:3]))
 
     rank1 = np.sum(np.array(average_ranks) <= 1) / float(len(average_ranks))
@@ -229,7 +258,6 @@ def validate(opt, val_loader, model):
     print("Average rank@3: %f" % rank3)
     print("Average rank@5: %f" % rank5)
     print("Average iou: %f" % miou)
-    return rank1, rank5, miou
 
 
 if __name__ == '__main__':

@@ -1,140 +1,19 @@
-# -----------------------------------------------------------
-# Stacked Cross Attention Network implementation based on 
-# https://arxiv.org/abs/1803.08024.
-# "Stacked Cross Attention for Image-Text Matching"
-# Kuang-Huei Lee, Xi Chen, Gang Hua, Houdong Hu, Xiaodong He
-#
-# Writen by Kuang-Huei Lee, 2018
-# ---------------------------------------------------------------
-"""SCAN model"""
-
 import torch
 import torch.nn as nn
-import torch.nn.init
-
 from torch.autograd import Variable
-from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
-from torch.nn.utils.weight_norm import weight_norm
-import torch.backends.cudnn as cudnn
-from torch.nn.utils.clip_grad import clip_grad_norm_
-
-from collections import OrderedDict
+import numpy as np
 
 
-def l1norm(X, dim, eps=1e-8):
-    """L1-normalize columns of X
-    """
-    norm = torch.abs(X).sum(dim=dim, keepdim=True) + eps
-    X = torch.div(X, norm)
-    return X
-
-
-def l2norm(X, dim, eps=1e-8):
-    """L2-normalize columns of X
-    """
-    norm = torch.pow(X, 2).sum(dim=dim, keepdim=True).sqrt() + eps
-    X = torch.div(X, norm)
-    return X
-
-
-def EncoderImage(img_dim, embed_size, precomp_enc_type='basic',
-                 no_imgnorm=False):
-    """A wrapper to image encoders. Chooses between an different encoders
-    that uses precomputed image features.
-    """
-    if precomp_enc_type == 'basic':
-        img_enc = EncoderImagePrecomp(
-            img_dim, embed_size, no_imgnorm)
-    elif precomp_enc_type == 'weight_norm':
-        img_enc = EncoderImageWeightNormPrecomp(
-            img_dim, embed_size, no_imgnorm)
-    else:
-        raise ValueError("Unknown precomp_enc_type: {}".format(precomp_enc_type))
-
-    return img_enc
-
-
-class EncoderImagePrecomp(nn.Module):
-
-    def __init__(self, img_dim, embed_size, no_imgnorm=False):
-        super(EncoderImagePrecomp, self).__init__()
-        self.embed_size = embed_size
-        self.no_imgnorm = no_imgnorm
-        self.fc = nn.Linear(img_dim, embed_size)
-
-    def forward(self, images):
-        """Extract image feature vectors."""
-        # assuming that the precomputed features are already l2-normalized
-        features = self.fc(images)
-
-        # normalize in the joint embedding space
-        if not self.no_imgnorm:
-            features = l2norm(features, dim=-1)
-        return features
-
-    def load_state_dict(self, state_dict):
-        """Copies parameters. overwritting the default one to
-        accept state_dict from Full model
-        """
-        own_state = self.state_dict()
-        new_state = OrderedDict()
-        for name, param in state_dict.items():
-            if name in own_state:
-                new_state[name] = param
-
-        super(EncoderImagePrecomp, self).load_state_dict(new_state)
-
-
-class EncoderImageWeightNormPrecomp(nn.Module):
-
-    def __init__(self, img_dim, embed_size, no_imgnorm=False):
-        super(EncoderImageWeightNormPrecomp, self).__init__()
-        self.embed_size = embed_size
-        self.no_imgnorm = no_imgnorm
-        self.fc = weight_norm(nn.Linear(img_dim, embed_size), dim=None)
-
-    def forward(self, images):
-        """Extract image feature vectors."""
-        # assuming that the precomputed features are already l2-normalized
-
-        print(images.shape)
-        features = self.fc(images)
-
-        # normalize in the joint embedding space
-        if not self.no_imgnorm:
-            features = l2norm(features, dim=-1)
-
-        print(features.shape)
-        return features
-
-    def load_state_dict(self, state_dict):
-        """Copies parameters. overwritting the default one to
-        accept state_dict from Full model
-        """
-        own_state = self.state_dict()
-        new_state = OrderedDict()
-        for name, param in state_dict.items():
-            if name in own_state:
-                new_state[name] = param
-
-        super(EncoderImageWeightNormPrecomp, self).load_state_dict(new_state)
-
-
-# RNN Based Language Model
 class EncoderText(nn.Module):
-
-    def __init__(self, vocab, word_dim, embed_size, num_layers,
-                 use_bi_gru=False, no_txtnorm=False):
+    def __init__(self, vocab, args):
         super(EncoderText, self).__init__()
-        self.embed_size = embed_size
-        self.no_txtnorm = no_txtnorm
 
         # word embedding
         self.embed = nn.Embedding.from_pretrained(vocab.vectors, freeze=False)
 
         # caption embedding
-        self.use_bi_gru = use_bi_gru
-        self.rnn = nn.GRU(word_dim, embed_size, num_layers, batch_first=True, bidirectional=use_bi_gru)
+        self.bi_gru = args.bi_gru
+        self.rnn = nn.GRU(args.word_dim, args.embed_size, args.num_layers, batch_first=True, bidirectional=args.bi_gru)
 
 
     def forward(self, x, lengths):
@@ -142,266 +21,121 @@ class EncoderText(nn.Module):
         """
         # Embed word ids to vectors
         x = self.embed(x)
-        packed = pack_padded_sequence(x, lengths, batch_first=True)
+        packed = nn.utils.rnn.pack_padded_sequence(x, lengths, batch_first=True)
 
         # Forward propagate RNN
         out, _ = self.rnn(packed)
 
         # Reshape *final* output to (batch_size, hidden_size)
-        padded = pad_packed_sequence(out, batch_first=True)
+        padded = nn.utils.rnn.pad_packed_sequence(out, batch_first=True)
         cap_emb, cap_len = padded
 
-        if self.use_bi_gru:
+        if self.bi_gru:
             cap_emb = (cap_emb[:,:,:cap_emb.size(2)//2] + cap_emb[:,:,cap_emb.size(2)//2:])/2
-
-        # normalization in the joint embedding space
-        if not self.no_txtnorm:
-            cap_emb = l2norm(cap_emb, dim=-1)
 
         return cap_emb
 
 
-def func_attention(query, context, opt, smooth, eps=1e-8):
-    """
-    query: (n_context, queryL, d)
-    context: (n_context, sourceL, d)
-    """
-    batch_size_q, queryL = query.size(0), query.size(1)
-    batch_size, sourceL = context.size(0), context.size(1)
+class SCAN(nn.Module):
+    def __init__(self, args, vocab):
+        super(SCAN, self).__init__()
+        self.batch_size = args.batch_size
+        self.margin = args.margin
+        self.embed_size = args.embed_size
+        self.img_dim = args.img_dim
+        self.encode_vis = nn.Linear(self.img_dim, self.embed_size)
+        self.word_dim = args.word_dim
+        self.encode_text = EncoderText(vocab, args)
+        self.criterion = nn.MarginRankingLoss(margin=self.margin)
+        self.cos = nn.CosineSimilarity(dim=2, eps=1e-6)
+        self.softmax = nn.Softmax(dim=2)
+        self.lambda_lse = 6.0
+        self.segments = self.get_segments()
 
+    def xattn_score_i2t(self, vis_feats, desc_feats):
+        combined_scores = []
+        desc_feats = desc_feats.repeat(len(vis_feats), 1, 1)
+        for idx in range(desc_feats.shape[1]):
+            word = desc_feats[:, idx, :]
+            word = word.unsqueeze(1)
+            word = word.repeat(1, vis_feats.shape[1], 1)
+            word_seg_scores = self.cos(word, vis_feats)
+            word_seg_scores = word_seg_scores.unsqueeze(-1)
+            combined_scores.append(word_seg_scores)
+        combined_scores = torch.cat(combined_scores, dim=-1)
+        combined_scores = self.softmax(combined_scores)  # torch.Size([64, 48, N])
+        combined_scores = combined_scores.unsqueeze(-1)
 
-    # Get attention
-    # --> (batch, d, queryL)
-    queryT = torch.transpose(query, 1, 2)
+        seg_sentence_feats = combined_scores.repeat(1, 1, 1, vis_feats.shape[-1]) \
+                             * desc_feats.unsqueeze(1).repeat(1, vis_feats.shape[1], 1, 1)
+        seg_sentence_feats = torch.sum(seg_sentence_feats, dim=2)
 
-    # (batch, sourceL, d)(batch, d, queryL)
-    # --> (batch, sourceL, queryL)
-    attn = torch.bmm(context, queryT)
-    if opt.raw_feature_norm == "softmax":
-        # --> (batch*sourceL, queryL)
-        attn = attn.view(batch_size*sourceL, queryL)
-        attn = nn.Softmax()(attn)
-        # --> (batch, sourceL, queryL)
-        attn = attn.view(batch_size, sourceL, queryL)
-    elif opt.raw_feature_norm == "l2norm":
-        attn = l2norm(attn, 2)
-    elif opt.raw_feature_norm == "clipped_l2norm":
-        attn = nn.LeakyReLU(0.1)(attn)
-        attn = l2norm(attn, 2)
-    elif opt.raw_feature_norm == "l1norm":
-        attn = l1norm_d(attn, 2)
-    elif opt.raw_feature_norm == "clipped_l1norm":
-        attn = nn.LeakyReLU(0.1)(attn)
-        attn = l1norm_d(attn, 2)
-    elif opt.raw_feature_norm == "clipped":
-        attn = nn.LeakyReLU(0.1)(attn)
-    elif opt.raw_feature_norm == "no_norm":
-        pass
-    else:
-        raise ValueError("unknown first norm type:", opt.raw_feature_norm)
-    # --> (batch, queryL, sourceL)
-    attn = torch.transpose(attn, 1, 2).contiguous()
-    # --> (batch*queryL, sourceL)
-    attn = attn.view(batch_size*queryL, sourceL)
-    attn = nn.Softmax()(attn*smooth)
-    # --> (batch, queryL, sourceL)
-    attn = attn.view(batch_size, queryL, sourceL)
-    # --> (batch, sourceL, queryL)
-    attnT = torch.transpose(attn, 1, 2).contiguous()
+        seg_sen_scores = self.cos(vis_feats, seg_sentence_feats)
 
-    # --> (batch, d, sourceL)
-    contextT = torch.transpose(context, 1, 2)
-    # (batch x d x sourceL)(batch x sourceL x queryL)
-    # --> (batch, d, queryL)
-    weightedContext = torch.bmm(contextT, attnT)
-    # --> (batch, queryL, d)
-    weightedContext = torch.transpose(weightedContext, 1, 2)
+        if not self.training:
+            final_scores = []
+            for seg in self.segments:
+                tmp_scores = seg_sen_scores[:, seg[0]*25:(seg[1]+1)*25].clone()
+                tmp_scores.mul_(self.lambda_lse).exp_()
+                tmp_scores = tmp_scores.sum(dim=1, keepdim=True)
+                tmp_scores = torch.log(tmp_scores)/self.lambda_lse
+                final_scores.append(tmp_scores)
+            final_scores = torch.cat(final_scores, dim=1)
+            return final_scores
 
-    return weightedContext, attnT
+        seg_sen_scores.mul_(self.lambda_lse).exp_()
+        seg_sen_scores = seg_sen_scores.sum(dim=1, keepdim=True)
+        seg_sen_scores = torch.log(seg_sen_scores) / self.lambda_lse
 
+        return seg_sen_scores
 
-def cosine_similarity(x1, x2, dim=1, eps=1e-8):
-    """Returns cosine similarity between x1 and x2, computed along dim."""
-    w12 = torch.sum(x1 * x2, dim)
-    w1 = torch.norm(x1, 2, dim)
-    w2 = torch.norm(x2, 2, dim)
-    return (w12 / (w1 * w2).clamp(min=eps)).squeeze()
+    def get_segments(self):
+        segments = []
+        for i in range(6):
+            for j in range(i, 6):
+                segments.append([i, j])
+            pass
 
+        return segments
 
-def xattn_score_t2i(images, captions, img_lens, cap_lens, opt):
-    """
-    Images: (n_image, n_regions, d) matrix of images
-    Captions: (n_caption, max_n_word, d) matrix of captions
-    CapLens: (n_caption) array of caption lengths
-    """
-    similarities = []
-    n_image = images.size(0)
-    n_caption = captions.size(0)
-    for i in range(n_caption):
-        n_word = cap_lens[i]
-        cap_i = captions[i, :n_word, :].unsqueeze(0).contiguous()
+    def forward(self, images, descriptions, img_lens, cap_lens, gts):
+        """
+        :param video_sample: Visual features and descriptions
+        :return: vis_hidden: Includes both visual and optical flow features
+                 desc_hidden: hidden states of descriptions where N is the number of
+                 annotations and hn is the number of words in the description
+        """
 
-        row_sim = []
-        for j in range(n_image):
-            n_frame = img_lens[j]
-            img_i = images[j, :n_frame, :].unsqueeze(0).contiguous()
-            weiContext, attn = func_attention(cap_i, img_i, opt, smooth=opt.lambda_softmax)
-            row_sim.append(cosine_similarity(cap_i, weiContext, dim=2))
+        images = images.float().cuda()
+        descriptions = descriptions.cuda()
 
-        # (n_image, n_word)
-        row_sim = torch.stack(row_sim, 0)
+        vis_embed = self.encode_vis(images)
+        desc_embed = self.encode_text(descriptions, cap_lens)
 
-        if opt.agg_func == 'LogSumExp':
-            row_sim.mul_(opt.lambda_lse).exp_()
-            row_sim = row_sim.sum(dim=1, keepdim=True)
-            row_sim = torch.log(row_sim)/opt.lambda_lse
-        elif opt.agg_func == 'Max':
-            row_sim = row_sim.max(dim=1, keepdim=True)[0]
-        elif opt.agg_func == 'Sum':
-            row_sim = row_sim.sum(dim=1, keepdim=True)
-        elif opt.agg_func == 'Mean':
-            row_sim = row_sim.mean(dim=1, keepdim=True)
+        if self.training:
+            total_loss = 0.
+            for idx in range(len(desc_embed)):
+                num_words = cap_lens[idx]
+                desc = desc_embed[idx, :num_words, :].unsqueeze(0)
+                rel_scores = self.xattn_score_i2t(vis_embed, desc)
+                rel_scores = rel_scores.squeeze()
+                actual_vid_scores = rel_scores[idx]
+                nm_vid_scores = rel_scores[np.arange(len(rel_scores)) != idx]
+                actual_vid_scores = actual_vid_scores.repeat(len(nm_vid_scores))
+                target = torch.FloatTensor(nm_vid_scores.size()).fill_(1)
+                target = Variable(target.cuda())
+                loss_sim = self.criterion(actual_vid_scores, nm_vid_scores, target)
+                total_loss += loss_sim
+
+            return total_loss
+
         else:
-            raise ValueError("unknown aggfunc: {}".format(opt.agg_func))
-        similarities.append(row_sim)
-
-    # (n_image, n_caption)
-    similarities = torch.cat(similarities, 1)
-    
-    return similarities
-
-class ContrastiveLoss(nn.Module):
-    """
-    Compute contrastive loss
-    """
-    def __init__(self, opt, margin=0, max_violation=False):
-        super(ContrastiveLoss, self).__init__()
-        self.opt = opt
-        self.margin = margin
-        self.max_violation = max_violation
-
-    def forward(self, images, captions, img_lens, cap_lens):
-        # compute image-sentence score matrix
-        scores = xattn_score_t2i(images, captions, img_lens, cap_lens, self.opt)
-
-        diagonal = scores.diag().view(images.size(0), 1)
-        d1 = diagonal.expand_as(scores)
-        d2 = diagonal.t().expand_as(scores)
-
-        # compare every diagonal score to scores in its column
-        # caption retrieval
-        cost_s = (self.margin + scores - d1).clamp(min=0)
-        # compare every diagonal score to scores in its row
-        # image retrieval
-        cost_im = (self.margin + scores - d2).clamp(min=0)
-
-        # clear diagonals
-        mask = torch.eye(scores.size(0)) > .5
-        I = Variable(mask)
-        if torch.cuda.is_available():
-            I = I.cuda()
-        cost_s = cost_s.masked_fill_(I, 0)
-        cost_im = cost_im.masked_fill_(I, 0)
-
-        # keep the maximum violating negative for each query
-        if self.max_violation:
-            cost_s = cost_s.max(1)[0]
-            cost_im = cost_im.max(0)[0]
-        return cost_s.sum() + cost_im.sum()
-
-
-class SCAN(object):
-    """
-    Stacked Cross Attention Network (SCAN) model
-    """
-    def __init__(self, opt, vocab):
-        # Build Models
-        self.grad_clip = opt.grad_clip
-        self.img_enc = EncoderImage(opt.img_dim, opt.embed_size,
-                                    precomp_enc_type=opt.precomp_enc_type,
-                                    no_imgnorm=opt.no_imgnorm)
-        self.txt_enc = EncoderText(vocab, opt.word_dim,
-                                   opt.embed_size, opt.num_layers, 
-                                   use_bi_gru=opt.bi_gru,  
-                                   no_txtnorm=opt.no_txtnorm)
-        if torch.cuda.is_available():
-            self.img_enc.cuda()
-            self.txt_enc.cuda()
-            cudnn.benchmark = True
-
-        # Loss and Optimizer
-        self.criterion = ContrastiveLoss(opt=opt,
-                                         margin=opt.margin,
-                                         max_violation=opt.max_violation)
-        params = list(self.txt_enc.parameters())
-        params += list(self.img_enc.fc.parameters())
-
-        self.params = params
-
-        self.optimizer = torch.optim.Adam(params, lr=opt.learning_rate)
-
-        self.Eiters = 0
-
-    def state_dict(self):
-        state_dict = [self.img_enc.state_dict(), self.txt_enc.state_dict()]
-        return state_dict
-
-    def load_state_dict(self, state_dict):
-        self.img_enc.load_state_dict(state_dict[0])
-        self.txt_enc.load_state_dict(state_dict[1])
-
-    def train_start(self):
-        """switch to train mode
-        """
-        self.img_enc.train()
-        self.txt_enc.train()
-
-    def val_start(self):
-        """switch to evaluate mode
-        """
-        self.img_enc.eval()
-        self.txt_enc.eval()
-
-    def forward_emb(self, images, captions, img_lens, cap_lens, ids=None):
-        """Compute the image and caption embeddings
-        """
-        # Set mini-batch dataset
-        images = Variable(images)
-        captions = Variable(captions)
-        if torch.cuda.is_available():
-            images = images.cuda()
-            captions = captions.cuda()
-
-        # Forward
-        img_emb = self.img_enc(images)
-
-        # cap_emb (tensor), cap_lens (list)
-        cap_emb = self.txt_enc(captions, cap_lens)
-        return img_emb, cap_emb
-
-    def forward_loss(self, img_emb, cap_emb, img_lens, cap_lens, **kwargs):
-        """Compute the loss given pairs of image and caption embeddings
-        """
-        loss = self.criterion(img_emb, cap_emb, img_lens, cap_lens)
-        self.logger.update('Le', loss.data, img_emb.size(0))
-        return loss
-
-    def train_emb(self, images, captions, img_lens, cap_lens, ids=None, *args):
-        """One training step given images and captions.
-        """
-        self.Eiters += 1
-        self.logger.update('Eit', self.Eiters)
-        self.logger.update('lr', self.optimizer.param_groups[0]['lr'])
-
-        # compute the embeddings
-        img_emb, cap_emb = self.forward_emb(images, captions, img_lens, cap_lens)
-
-        # measure accuracy and record loss
-        self.optimizer.zero_grad()
-        loss = self.forward_loss(img_emb, cap_emb, img_lens, cap_lens)
-
-        # compute gradient and do SGD step
-        loss.backward()
-        if self.grad_clip > 0:
-            clip_grad_norm_(self.params, self.grad_clip)
-        self.optimizer.step()
+            scores = []
+            for idx in range(len(desc_embed)):
+                tmp_vis_feats = vis_embed[idx].unsqueeze(0)
+                num_words = cap_lens[idx]
+                desc = desc_embed[idx, :num_words, :].unsqueeze(0)
+                rel_scores = self.xattn_score_i2t(tmp_vis_feats, desc)
+                scores.append(rel_scores)
+            scores = torch.cat(scores, dim=0)
+            return scores, gts
