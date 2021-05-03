@@ -17,9 +17,9 @@ from evaluation import AverageMeter, LogCollector
 def main():
     # Hyper Parameters
     parser = argparse.ArgumentParser()
-    parser.add_argument('--data_path', default='../VideoMomentRetrieval/data/',
+    parser.add_argument('--data_path', default='data/',
                         help='path to datasets')
-    parser.add_argument('--pretrained_path', default='../VideoMomentRetrieval/rgb_vgg_fc7_features/',
+    parser.add_argument('--pretrained_path', default='rgb_vgg_fc7_features/',
                         help='path to extracted features')
     parser.add_argument('--vocab_path', default='./vocab/',
                         help='Path to saved vocabulary json files.')
