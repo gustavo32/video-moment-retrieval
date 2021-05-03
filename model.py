@@ -237,16 +237,17 @@ def xattn_score_t2i(images, captions, img_lens, cap_lens, opt):
     similarities = []
     n_image = images.size(0)
     n_caption = captions.size(0)
-    for i in range(n_caption):
-        n_word = cap_lens[i]
-        cap_i = captions[i, :n_word, :].unsqueeze(0).contiguous()
+    for i in range(n_image):
+        n_frame = img_lens[i]
+        img_i = images[i, :n_frame, :].unsqueeze(0).contiguous()
 
         row_sim = []
-        for j in range(n_image):
-            n_frame = img_lens[j]
-            img_i = images[j, :n_frame, :].unsqueeze(0).contiguous()
-            weiContext, attn = func_attention(cap_i, img_i, opt, smooth=opt.lambda_softmax)
-            row_sim.append(cosine_similarity(cap_i, weiContext, dim=2))
+        for j in range(n_caption):
+            n_word = cap_lens[j]
+            cap_i = captions[j, :n_word, :].unsqueeze(0).contiguous()
+
+            weiContext, attn = func_attention(img_i, cap_i, opt, smooth=opt.lambda_softmax)
+            row_sim.append(cosine_similarity(img_i, weiContext,  dim=2))
 
         # (n_image, n_word)
         row_sim = torch.stack(row_sim, 0)
@@ -260,7 +261,7 @@ def xattn_score_t2i(images, captions, img_lens, cap_lens, opt):
         elif opt.agg_func == 'Sum':
             row_sim = row_sim.sum(dim=1, keepdim=True)
         elif opt.agg_func == 'Mean':
-            row_sim = row_sim.mean(dim=1, keepdim=True)
+            row_sim = row_sim.sum(dim=1, keepdim=True)
         else:
             raise ValueError("unknown aggfunc: {}".format(opt.agg_func))
         similarities.append(row_sim)

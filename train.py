@@ -79,6 +79,7 @@ def main():
 
     opt.bi_gru = True
     opt.max_violation = True
+    opt.agg_func = "Mean"
     print(opt)
 
     logging.basicConfig(format='%(asctime)s %(message)s', level=logging.INFO)
@@ -192,19 +193,21 @@ def validate(opt, val_loader, model):
                 if p[1] <= (val_data[2][j] - 1) // 25:
                     proposal_img_emb = img_emb[j, p[0]*25:min((p[1]+1)*25, val_data[2][j])].unsqueeze(0).contiguous()
                     cap_i = cap_emb[j, :val_data[3][j], :].unsqueeze(0).contiguous()
-                    weiContext, attn = func_attention(cap_i, proposal_img_emb, opt, smooth=opt.lambda_softmax)
-                    row_sim.append(cosine_similarity(cap_i, weiContext, dim=2))
+                    weiContext, attn = func_attention(proposal_img_emb, cap_i, opt, smooth=opt.lambda_softmax)
+                    sim = cosine_similarity(proposal_img_emb, weiContext, dim=2)
+                    if opt.agg_func == 'LogSumExp':
+                        sim.mul_(opt.lambda_lse).exp_()
+                        sim = sim.sum(dim=0, keepdim=True)
+                        sim = torch.log(sim) / opt.lambda_lse
+                    elif opt.agg_func == 'Mean':
+                        sim = sim.sum(dim=0, keepdim=True)
+                    row_sim.append(sim.view(-1))
                 else:
-                    row_sim.append(torch.ones([val_data[3][j]])*-1.)
+                    row_sim.append(torch.tensor([-5.]).cuda()) #arrumar isso
+
             row_sim = torch.stack(row_sim, 0)
-            if opt.agg_func == 'LogSumExp':
-                row_sim.mul_(opt.lambda_lse).exp_()
-                row_sim = row_sim.sum(dim=1, keepdim=True)
-                row_sim = torch.log(row_sim) / opt.lambda_lse
-            elif opt.agg_func == 'Mean':
-                row_sim = row_sim.mean(dim=1, keepdim=True)
-            ind = torch.argsort(row_sim.view(-1), descending=True)
-            batch_proposals.append(torch.Tensor(proposals[ind]).int())
+            ind = torch.argsort(row_sim.view(-1), descending=True).cpu().numpy()
+            batch_proposals.append(torch.tensor(proposals[ind]))
 
         all_proposals.append(torch.cat(batch_proposals))
         all_y_true.append(val_data[-1])
@@ -232,11 +235,17 @@ def validate(opt, val_loader, model):
     print("Average iou: %f" % miou)
     return rank1, rank5, miou
 
+# Frame level attention with word
 # Average rank@1: 0.144498
 # Average rank@3: 0.323206
 # Average rank@5: 0.421053
 # Average iou: 0.256846
 
+# Word level attention with image sequence
+# Average rank@1: 0.102632
+# Average rank@3: 0.321531
+# Average rank@5: 0.538995
+# Average iou: 0.244398
 
 if __name__ == '__main__':
     main()
