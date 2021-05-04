@@ -79,7 +79,6 @@ def main():
 
     opt.bi_gru = True
     opt.max_violation = True
-    opt.agg_func = "Mean"
     print(opt)
 
     logging.basicConfig(format='%(asctime)s %(message)s', level=logging.INFO)
@@ -165,6 +164,32 @@ def rank(preds, gt):
     return preds.index(list(gt)) + 1
 
 
+def moving_average(x, window):
+    return np.convolve(x, np.ones(window), 'valid') / window
+
+
+def each_pred_moving_average(scores, period):
+    length = len(scores)
+    mean_pad_scores = np.pad(scores, (period // 2, period // 2), "mean")
+    ma = moving_average(mean_pad_scores, period)
+    argmax_ma = np.argmax(ma)
+    proposals = ma > scores.mean()
+
+    start_pred = argmax_ma
+    while start_pred >= 0 and proposals[start_pred]:
+        start_pred -= 1
+
+    end_pred = argmax_ma
+    while end_pred < length and proposals[end_pred]:
+        end_pred += 1
+
+    return [start_pred + 1, end_pred - 1]
+
+
+def prediction_by_moving_average(scores_videos, period):
+    return np.apply_along_axis(each_pred_moving_average, 1, scores_videos, period=period)
+
+
 def validate(opt, val_loader, model):
     batch_time = AverageMeter()
     val_logger = LogCollector()
@@ -174,66 +199,100 @@ def validate(opt, val_loader, model):
 
     end = time.time()
 
-    proposals = np.asarray(list(product(range(6), range(6))))
-    proposals = proposals[proposals[:, 1] >= proposals[:, 0]]
-
-    all_proposals = []
     all_y_true = []
+    all_preds_5 = []
+    all_preds_9 = []
+    all_preds_15 = []
+    all_preds_30 = []
     for i, val_data in enumerate(val_loader):
         # make sure val logger is used
         model.logger = val_logger
 
         # compute the embeddings
-        img_emb, cap_emb = model.forward_emb(*val_data)
+        with torch.no_grad():
+            img_emb, cap_emb = model.forward_emb(*val_data)
 
-        batch_proposals = []
+        batch_preds_5 = []
+        batch_preds_9 = []
+        batch_preds_15 = []
+        batch_preds_30 = []
         for j in range(len(img_emb)):
-            row_sim = []
-            for p in proposals:
-                if p[1] <= (val_data[2][j] - 1) // 25:
-                    proposal_img_emb = img_emb[j, p[0]*25:min((p[1]+1)*25, val_data[2][j])].unsqueeze(0).contiguous()
-                    cap_i = cap_emb[j, :val_data[3][j], :].unsqueeze(0).contiguous()
-                    weiContext, attn = func_attention(proposal_img_emb, cap_i, opt, smooth=opt.lambda_softmax)
-                    sim = cosine_similarity(proposal_img_emb, weiContext, dim=2)
-                    if opt.agg_func == 'LogSumExp':
-                        sim.mul_(opt.lambda_lse).exp_()
-                        sim = sim.sum(dim=0, keepdim=True)
-                        sim = torch.log(sim) / opt.lambda_lse
-                    elif opt.agg_func == 'Mean':
-                        sim = sim.sum(dim=0, keepdim=True)
-                    row_sim.append(sim.view(-1))
-                else:
-                    row_sim.append(torch.tensor([-5.]).cuda()) #arrumar isso
+            cap_i = cap_emb[j, :val_data[3][j], :].unsqueeze(0).contiguous()
+            img_i = img_emb[j].unsqueeze(0).contiguous()
+            weiContext, attn = func_attention(img_i, cap_i, opt, smooth=opt.lambda_softmax)
+            sim = cosine_similarity(img_i, weiContext, dim=2)
+            batch_preds_5.append(torch.tensor(each_pred_moving_average(sim.cpu().numpy(), 5)) // 25)
+            batch_preds_9.append(torch.tensor(each_pred_moving_average(sim.cpu().numpy(), 9)) // 25)
+            batch_preds_15.append(torch.tensor(each_pred_moving_average(sim.cpu().numpy(), 15)) // 25)
+            batch_preds_30.append(torch.tensor(each_pred_moving_average(sim.cpu().numpy(), 30)) // 25)
 
-            row_sim = torch.stack(row_sim, 0)
-            ind = torch.argsort(row_sim.view(-1), descending=True).cpu().numpy()
-            batch_proposals.append(torch.tensor(proposals[ind]))
-
-        all_proposals.append(torch.cat(batch_proposals))
+        all_preds_5.append(torch.vstack(batch_preds_5))
+        all_preds_9.append(torch.vstack(batch_preds_9))
+        all_preds_15.append(torch.vstack(batch_preds_15))
+        all_preds_30.append(torch.vstack(batch_preds_30))
         all_y_true.append(val_data[-1])
 
-    all_proposals = torch.cat(all_proposals).view(-1, 21, 2)
+    all_preds_5 = torch.vstack(all_preds_5)
+    all_preds_9 = torch.vstack(all_preds_9)
+    all_preds_15 = torch.vstack(all_preds_15)
+    all_preds_30 = torch.vstack(all_preds_30)
     all_y_true = torch.cat(all_y_true)
 
     average_iou = []
     average_ranks = []
-    for gts, preds in zip(all_y_true, all_proposals):
-        pred = preds[0]
+    for gts, pred in zip(all_y_true.numpy(), all_preds_5.numpy()):
         ious = [iou(pred, gt) for gt in gts]
         average_iou.append(np.mean(np.sort(ious)[-3:]))
-        list_preds = preds.numpy().tolist()
-        ranks = [rank(list_preds, gt) for gt in gts.numpy()]
+        ranks = [1 if tuple(gt) == tuple(pred) else 2 for gt in gts]
         average_ranks.append(np.mean(np.sort(ranks)[:3]))
-
     rank1 = np.sum(np.array(average_ranks) <= 1) / float(len(average_ranks))
-    rank3 = np.sum(np.array(average_ranks) <= 3) / float(len(average_ranks))
-    rank5 = np.sum(np.array(average_ranks) <= 5) / float(len(average_ranks))
     miou = np.mean(average_iou)
+    print("PERIOD 5:")
     print("Average rank@1: %f" % rank1)
-    print("Average rank@3: %f" % rank3)
-    print("Average rank@5: %f" % rank5)
     print("Average iou: %f" % miou)
-    return rank1, rank5, miou
+
+
+    average_iou = []
+    average_ranks = []
+    for gts, pred in zip(all_y_true.numpy(), all_preds_9.numpy()):
+        ious = [iou(pred, gt) for gt in gts]
+        average_iou.append(np.mean(np.sort(ious)[-3:]))
+        ranks = [1 if tuple(gt) == tuple(pred) else 2 for gt in gts]
+        average_ranks.append(np.mean(np.sort(ranks)[:3]))
+    rank1 = np.sum(np.array(average_ranks) <= 1) / float(len(average_ranks))
+    miou = np.mean(average_iou)
+    print("PERIOD 9:")
+    print("Average rank@1: %f" % rank1)
+    print("Average iou: %f" % miou)
+
+
+    average_iou = []
+    average_ranks = []
+    for gts, pred in zip(all_y_true.numpy(), all_preds_15.numpy()):
+        ious = [iou(pred, gt) for gt in gts]
+        average_iou.append(np.mean(np.sort(ious)[-3:]))
+        ranks = [1 if tuple(gt) == tuple(pred) else 2 for gt in gts]
+        average_ranks.append(np.mean(np.sort(ranks)[:3]))
+    rank1 = np.sum(np.array(average_ranks) <= 1) / float(len(average_ranks))
+    miou = np.mean(average_iou)
+    print("PERIOD 15:")
+    print("Average rank@1: %f" % rank1)
+    print("Average iou: %f" % miou)
+
+
+    average_iou = []
+    average_ranks = []
+    for gts, pred in zip(all_y_true.numpy(), all_preds_30.numpy()):
+        ious = [iou(pred, gt) for gt in gts]
+        average_iou.append(np.mean(np.sort(ious)[-3:]))
+        ranks = [1 if tuple(gt) == tuple(pred) else 2 for gt in gts]
+        average_ranks.append(np.mean(np.sort(ranks)[:3]))
+    miou = np.mean(average_iou)
+    print("PERIOD 30:")
+    print("Average rank@1: %f" % rank1)
+    print("Average iou: %f" % miou)
+
+    return rank1, miou
 
 # Frame level attention with word
 # Average rank@1: 0.144498

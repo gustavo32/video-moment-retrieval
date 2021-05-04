@@ -261,7 +261,7 @@ def xattn_score_t2i(images, captions, img_lens, cap_lens, opt):
         elif opt.agg_func == 'Sum':
             row_sim = row_sim.sum(dim=1, keepdim=True)
         elif opt.agg_func == 'Mean':
-            row_sim = row_sim.sum(dim=1, keepdim=True)
+            row_sim = row_sim.mean(dim=1, keepdim=True)
         else:
             raise ValueError("unknown aggfunc: {}".format(opt.agg_func))
         similarities.append(row_sim)
