@@ -218,7 +218,7 @@ def validate(opt, val_loader, model):
         batch_preds_30 = []
         for j in range(len(img_emb)):
             cap_i = cap_emb[j, :val_data[3][j], :].unsqueeze(0).contiguous()
-            img_i = img_emb[j].unsqueeze(0).contiguous()
+            img_i = img_emb[j, :val_data[2][j], :].unsqueeze(0).contiguous()
             weiContext, attn = func_attention(img_i, cap_i, opt, smooth=opt.lambda_softmax)
             sim = cosine_similarity(img_i, weiContext, dim=2)
             batch_preds_5.append(torch.tensor(each_pred_moving_average(sim.cpu().numpy(), 5)) // 25)
@@ -305,6 +305,31 @@ def validate(opt, val_loader, model):
 # Average rank@3: 0.321531
 # Average rank@5: 0.538995
 # Average iou: 0.244398
+
+# Word level attention with image sequence and post processing (logsumexp)
+# PERIOD 5:
+# Average rank@1: 0.080861
+# Average iou: 0.300873
+# PERIOD 9:
+# Average rank@1: 0.064115
+# Average iou: 0.295783
+# PERIOD 15:
+# Average rank@1: 0.046890
+# Average iou: 0.291571
+
+# Word level attention with image sequence and post processing (sum)
+# PERIOD 5:
+# Average rank@1: 0.080383
+# Average iou: 0.305431
+# PERIOD 9:
+# Average rank@1: 0.063158
+# Average iou: 0.300831
+# PERIOD 15:
+# Average rank@1: 0.0476088
+# Average iou: 0.296518
+
+
+
 
 if __name__ == '__main__':
     main()
