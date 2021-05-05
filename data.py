@@ -4,6 +4,8 @@ import json
 import pandas as pd
 import h5py
 import re
+import numpy as np
+import os
 
 
 class PrecompDataset(data.Dataset):
@@ -11,15 +13,21 @@ class PrecompDataset(data.Dataset):
     Load precomputed captions and video features
     """
 
-    def __init__(self, data_path, data_split, pretrained_path, vocab):
+    def __init__(self, data_path, data_split, video_features_path, audio_features_path, vocab):
         self.vocab = vocab
 
         with open(data_path + data_split + ".json", "r") as f:
             self.info = pd.Series(json.load(f)).apply(pd.Series)
         self.info = self.info[self.info["description"].str.split(" ").str.len() >= 2].reset_index(drop=True)
 
-        self.info['features_path'] = self.info['video'].apply(
-            lambda x: pretrained_path + "fc7_subsample5_fps25_" + x + ".h5")
+        self.info['video_features_path'] = self.info['video'].apply(
+            lambda x: video_features_path + "fc7_subsample5_fps25_" + x + ".h5")
+
+        self.info["audio_features_path"] = self.info["video"].apply(
+            lambda x: audio_features_path + x + ".npy")
+
+        self.info["audio_exists"] = self.info["audio_features_path"].apply(os.path.isfile)
+        self.info = self.info[self.info["audio_exists"]].reset_index(drop=True)
 
         self.length = len(self.info)
 
@@ -32,9 +40,10 @@ class PrecompDataset(data.Dataset):
 
     def __getitem__(self, idx):
         # handle the image redundancy
-        image = self.load_pretrained_features(self.info["features_path"][idx])
+        image = self.load_pretrained_features(self.info["video_features_path"][idx])
         caption = re.sub(r"[^a-z\- ]", "", self.info["description"][idx]\
                          .replace("'s", "")).split(" ")
+        audio = torch.Tensor(np.load(self.info["audio_features_path"][idx]))
         y_true = torch.tensor(self.info["times"][idx][:4])
 
         target = []
@@ -48,7 +57,7 @@ class PrecompDataset(data.Dataset):
             target.append(int(self.vocab.stoi["start"]))
             target.append(int(self.vocab.stoi["end"]))
 
-        return image, torch.Tensor(target), y_true
+        return image, torch.Tensor(target), audio, y_true
 
     def __len__(self):
         return self.length
@@ -68,7 +77,7 @@ def collate_fn(data):
     """
     # Sort a data list by caption length
     data.sort(key=lambda x: len(x[1]), reverse=True)
-    images, captions, y_true = zip(*data)
+    images, captions, audios, y_true = zip(*data)
 
     img_lens = [len(img) for img in images]
     max_len = max(img_lens)
@@ -78,6 +87,13 @@ def collate_fn(data):
         end = img_lens[i]
         padded_images[i, :end] = img[:end]
 
+    audio_lens = [len(aud) for aud in audios]
+    padded_audios = torch.zeros(len(audios), max_len, audios[0].shape[-1]).float()
+    for i, audio in enumerate(audios):
+        end = audio_lens[i]
+        padded_audios[i, :end] = audio[:end]
+
+
     # Merge captions (convert tuple of 1D tensor to 2D tensor)
     cap_lens = [len(cap) for cap in captions]
     targets = torch.zeros(len(captions), max(cap_lens)).long()
@@ -85,13 +101,13 @@ def collate_fn(data):
         end = cap_lens[i]
         targets[i, :end] = cap[:end]
 
-    return padded_images, targets, img_lens, cap_lens, torch.stack(y_true)
+    return padded_images, targets, padded_audios, img_lens, cap_lens, torch.stack(y_true)
 
 
 def get_precomp_loader(data_path, data_split, vocab, opt, batch_size=100,
                        shuffle=True, num_workers=2):
     """Returns torch.utils.data.DataLoader for custom coco dataset."""
-    dset = PrecompDataset(data_path, data_split, opt.pretrained_path, vocab)
+    dset = PrecompDataset(data_path, data_split, opt.video_features_path, opt.audio_features_path, vocab)
 
     data_loader = torch.utils.data.DataLoader(dataset=dset,
                                               batch_size=batch_size,

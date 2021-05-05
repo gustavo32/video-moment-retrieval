@@ -19,8 +19,10 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--data_path', default='data/',
                         help='path to datasets')
-    parser.add_argument('--pretrained_path', default='rgb_vgg_fc7_features/',
-                        help='path to extracted features')
+    parser.add_argument('--video_features_path', default='rgb_vgg_fc7_features/',
+                        help='path to video extracted features')
+    parser.add_argument('--audio_features_path', default='audio_mfcc_features/',
+                        help='path to audio extracted features')
     parser.add_argument('--vocab_path', default='./vocab/',
                         help='Path to saved vocabulary json files.')
     parser.add_argument('--margin', default=0.7, type=float,
@@ -29,6 +31,10 @@ def main():
                         help='Number of training epochs.')
     parser.add_argument('--batch_size', default=16, type=int,
                         help='Size of a training mini-batch.')
+    parser.add_argument('--img_dim', default=4096, type=int,
+                        help='Dimensionality of the image embedding.')
+    parser.add_argument('--audio_dim', default=40, type=int,
+                        help='Dimensionality of the audio embedding.')
     parser.add_argument('--word_dim', default=50, type=int,
                         help='Dimensionality of the word embedding.')
     parser.add_argument('--embed_size', default=256, type=int,
@@ -55,8 +61,6 @@ def main():
                         help='path to latest checkpoint (default: none)')
     parser.add_argument('--max_violation', action='store_true',
                         help='Use max instead of sum in the rank loss.')
-    parser.add_argument('--img_dim', default=4096, type=int,
-                        help='Dimensionality of the image embedding.')
     parser.add_argument('--no_imgnorm', action='store_true',
                         help='Do not normalize the image embeddings.')
     parser.add_argument('--no_txtnorm', action='store_true',
@@ -67,8 +71,6 @@ def main():
                         help='LogSumExp|Mean|Max|Sum')
     parser.add_argument('--cross_attn', default="t2i",
                         help='t2i|i2t')
-    parser.add_argument('--precomp_enc_type', default="basic",
-                        help='basic|weight_norm')
     parser.add_argument('--bi_gru', action='store_true',
                         help='Use bidirectional GRU.')
     parser.add_argument('--lambda_lse', default=6., type=float,
@@ -210,15 +212,15 @@ def validate(opt, val_loader, model):
 
         # compute the embeddings
         with torch.no_grad():
-            img_emb, cap_emb = model.forward_emb(*val_data)
+            video_emb, cap_emb = model.forward_emb(*val_data)
 
         batch_preds_5 = []
         batch_preds_9 = []
         batch_preds_15 = []
         batch_preds_30 = []
-        for j in range(len(img_emb)):
+        for j in range(len(video_emb)):
             cap_i = cap_emb[j, :val_data[3][j], :].unsqueeze(0).contiguous()
-            img_i = img_emb[j].unsqueeze(0).contiguous()
+            img_i = video_emb[j].unsqueeze(0).contiguous()
             weiContext, attn = func_attention(img_i, cap_i, opt, smooth=opt.lambda_softmax)
             sim = cosine_similarity(img_i, weiContext, dim=2)
             batch_preds_5.append(torch.tensor(each_pred_moving_average(sim.cpu().numpy(), 5)) // 25)
