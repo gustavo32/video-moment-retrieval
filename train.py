@@ -219,8 +219,8 @@ def validate(opt, val_loader, model):
         batch_preds_15 = []
         batch_preds_30 = []
         for j in range(len(video_emb)):
-            cap_i = cap_emb[j, :val_data[3][j], :].unsqueeze(0).contiguous()
-            img_i = video_emb[j].unsqueeze(0).contiguous()
+            cap_i = cap_emb[j, :val_data[4][j], :].unsqueeze(0).contiguous()
+            img_i = video_emb[j, :val_data[3][j], :].unsqueeze(0).contiguous()
             weiContext, attn = func_attention(img_i, cap_i, opt, smooth=opt.lambda_softmax)
             sim = cosine_similarity(img_i, weiContext, dim=2)
             batch_preds_5.append(torch.tensor(each_pred_moving_average(sim.cpu().numpy(), 5)) // 25)
