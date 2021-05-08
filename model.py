@@ -80,7 +80,7 @@ class EncoderText(nn.Module):
         self.no_txtnorm = no_txtnorm
 
         # word embedding
-        self.embed = nn.Embedding.from_pretrained(vocab.vectors, freeze=False)
+        self.embed = nn.Embedding.from_pretrained(vocab.vectors, freeze=True)
 
         # caption embedding
         self.use_bi_gru = use_bi_gru
@@ -284,9 +284,9 @@ class SCAN(object):
                                          margin=opt.margin,
                                          max_violation=opt.max_violation)
         params = list(self.txt_enc.parameters())
-        params += list(self.video_enc.deep_features_video.parameters())
-        params += list(self.video_enc.deep_features_audio.parameters())
-        params += list(self.video_enc.relu_layer.parameters())
+        params += list(self.video_enc.parameters())
+        # params += list(self.video_enc.relu_layer.parameters())
+        # params += list(self.video_enc.deep_features_audio.parameters())
 
         self.params = params
 

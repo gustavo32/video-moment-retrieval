@@ -81,6 +81,7 @@ def main():
 
     opt.bi_gru = True
     opt.max_violation = True
+    opt.agg_func = "Sum"
     print(opt)
 
     logging.basicConfig(format='%(asctime)s %(message)s', level=logging.INFO)
